@@ -1,3 +1,13 @@
+"""
+Optimized Flask Shopify Scraper with Real-time Logging
+Features:
+- Fast concurrent scraping with ThreadPoolExecutor
+- Real-time log streaming to frontend
+- Optimized download performance
+- Simple, efficient approach
+- Visual progress indicators with emoji logs
+"""
+
 import os
 import time
 import json
@@ -10,33 +20,18 @@ from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from flask import Flask, request, render_template_string, jsonify, send_from_directory
 from bs4 import BeautifulSoup
-from PIL import Image, ImageFilter, ImageEnhance, ImageDraw
+from PIL import Image, ImageFilter, ImageEnhance
 
 # Disable SSL warnings
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Optional dependencies
 try:
-    from backgroundremover.bg import remove as remove_bg
+    from rembg import remove
     REMBG_AVAILABLE = True
 except ImportError:
     REMBG_AVAILABLE = False
-    print("BackgroundRemover not available. Install with: pip install backgroundremover")
-
-try:
-    from openai import OpenAI
-    OPENAI_AVAILABLE = True
-except ImportError:
-    OPENAI_AVAILABLE = False
-    print("OpenAI not available. Install with: pip install openai")
-
-try:
-    from transformers import CLIPProcessor, CLIPModel
-    import torch
-    CLIP_AVAILABLE = True
-except ImportError:
-    CLIP_AVAILABLE = False
-    print("Transformers/CLIP not available. Install with: pip install transformers torch")
+    print("RemBG not available. Install with: pip install rembg")
 
 app = Flask(__name__)
 
@@ -301,265 +296,6 @@ def run_scraping_job(job_id):
         log_message(job_id, f"Scraping failed: {e}", "error")
         meta['state'] = 'failed'
 
-def generate_background(width, height, bg_type):
-    """Generate a background image (white or lifestyle/studio)."""
-    try:
-        img = Image.new('RGBA', (width, height), (255, 255, 255, 255))  # Default white background
-        draw = ImageDraw.Draw(img)
-        
-        if bg_type == 'lifestyle':
-            # Simulate lifestyle background with a soft gradient
-            colors = [(200, 220, 255), (230, 240, 255)]  # Light blue gradient
-            for y in range(height):
-                r = int(colors[0][0] + (colors[1][0] - colors[0][0]) * y / height)
-                g = int(colors[0][1] + (colors[1][1] - colors[0][1]) * y / height)
-                b = int(colors[0][2] + (colors[1][2] - colors[0][2]) * y / height)
-                draw.line((0, y, width, y), fill=(r, g, b, 255))
-        elif bg_type == 'studio':
-            # Simulate studio background with a subtle radial gradient
-            center = (width // 2, height // 2)
-            max_radius = (width**2 + height**2)**0.5 / 2
-            for y in range(height):
-                for x in range(width):
-                    radius = ((x - center[0])**2 + (y - center[1])**2)**0.5
-                    intensity = min(255, int(255 * (1 - radius / max_radius)))
-                    draw.point((x, y), fill=(intensity, intensity, intensity, 255))
-        
-        return img, None
-    except Exception as e:
-        return None, f"Failed to generate background: {str(e)}"
-
-def apply_background(foreground_path, output_path, bg_type):
-    """Apply generated background to a foreground image."""
-    try:
-        with Image.open(foreground_path) as fg_img:
-            fg_img = fg_img.convert('RGBA')
-            width, height = fg_img.size
-            
-            bg_img, error = generate_background(width, height, bg_type)
-            if error:
-                return False, error
-            
-            # Composite foreground onto background
-            result = Image.alpha_composite(bg_img, fg_img)
-            result.save(output_path, 'PNG', optimize=True)
-            return True, None
-    except Exception as e:
-        return False, f"Failed to apply background: {str(e)}"
-
-def process_background_generation_job(job_id, filenames, bg_type):
-    """Process selected images for background generation."""
-    try:
-        meta = JOBS[job_id]
-        meta['state'] = 'bg_generating'
-        
-        log_message(job_id, f"Starting background generation ({bg_type}) for {len(filenames)} images...", "info")
-        
-        save_dir = Path(meta['folder'])
-        bg_generated_dir = save_dir / 'bg_generated'
-        bg_generated_dir.mkdir(exist_ok=True)
-        
-        processed_count = 0
-        for filename in filenames:
-            if STOP_FLAGS.get(job_id, False):
-                log_message(job_id, "Background generation stopped", "warning")
-                meta['state'] = 'stopped'
-                return
-            
-            # Use background-removed image if available, else original
-            input_path = None
-            for img in meta['images']:
-                if img.get('filename') == filename:
-                    if img.get('bg_removed_filename'):
-                        input_path = save_dir / 'bg_removed' / img['bg_removed_filename']
-                    else:
-                        input_path = save_dir / filename
-                    break
-            
-            if not input_path or not input_path.exists():
-                log_message(job_id, f"File not found: {filename}", "error")
-                meta['stats']['errors'] += 1
-                continue
-            
-            output_filename = f"{input_path.stem}_{bg_type}.png"
-            output_path = bg_generated_dir / output_filename
-            
-            start_time = time.time()
-            success, error = apply_background(input_path, output_path, bg_type)
-            
-            if success:
-                elapsed = time.time() - start_time
-                log_message(job_id, f"Background generated: {filename} -> {output_filename} ({elapsed:.2f}s)", "success")
-                processed_count += 1
-                
-                # Update metadata
-                with JOBS_LOCK:
-                    for img in meta['images']:
-                        if img.get('filename') == filename:
-                            img['bg_generated_filename'] = output_filename
-                            break
-            else:
-                log_message(job_id, error, "error")
-                meta['stats']['errors'] += 1
-        
-        # Create ZIP for background-generated images
-        try:
-            zip_path = DOWNLOADS_DIR / f"{job_id}_bg_generated.zip"
-            shutil.make_archive(str(zip_path.with_suffix('')), 'zip', str(bg_generated_dir))
-            log_message(job_id, f"Created background-generated ZIP: {processed_count} images", "success")
-        except Exception as e:
-            log_message(job_id, f"Background-generated ZIP creation failed: {str(e)}", "error")
-            meta['stats']['errors'] += 1
-        
-        if processed_count > 0:
-            meta['state'] = 'bg_generated'
-            log_message(job_id, f"Background generation ({bg_type}) completed successfully!", "success")
-        else:
-            meta['state'] = 'failed'
-            log_message(job_id, "Background generation failed: No images processed", "error")
-    
-    except Exception as e:
-        log_message(job_id, f"Background generation job failed: {str(e)}", "error")
-        meta['state'] = 'failed'
-
-from PIL import Image
-
-# Optional dependencies
-try:
-    import cv2
-    import numpy as np
-    OPENCV_AVAILABLE = True
-except ImportError:
-    OPENCV_AVAILABLE = False
-    print("OpenCV not available. Install with: pip install opencv-python")
-
-def remove_background_pillow(input_path, output_path):
-    """Remove near-white background from an image using Pillow."""
-    try:
-        with Image.open(input_path) as img:
-            img = img.convert('RGBA')  # Ensure image has alpha channel
-            pixels = img.load()
-            width, height = img.size
-
-            # Threshold for near-white pixels (adjustable)
-            threshold = 200
-
-            for x in range(width):
-                for y in range(height):
-                    r, g, b, a = pixels[x, y]
-                    # If pixel is near-white, set alpha to 0 (transparent)
-                    if r > threshold and g > threshold and b > threshold:
-                        pixels[x, y] = (r, g, b, 0)
-
-            img.save(output_path, 'PNG', optimize=True)
-            return True, None
-    except Exception as e:
-        return False, f"Failed to process {input_path.name}: {str(e)}"
-
-def remove_background(input_path, output_path):
-    """Remove background using OpenCV or fallback to Pillow."""
-    if OPENCV_AVAILABLE:
-        try:
-            # Read image with OpenCV
-            img = cv2.imread(str(input_path))
-            if img is None:
-                return False, f"Failed to load image {input_path.name}"
-
-            # Convert to RGB (OpenCV uses BGR by default)
-            img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-            height, width = img_rgb.shape[:2]
-
-            # Create a mask for GrabCut
-            mask = np.zeros((height, width), np.uint8)
-            bgd_model = np.zeros((1, 65), np.float64)
-            fgd_model = np.zeros((1, 65), np.float64)
-
-            # Define a rectangle for GrabCut (adjustable, here we use the entire image with a margin)
-            rect = (10, 10, width - 20, height - 20)
-
-            # Apply GrabCut
-            cv2.grabCut(img_rgb, mask, rect, bgd_model, fgd_model, 5, cv2.GC_INIT_WITH_RECT)
-
-            # Create mask where 0 and 2 are background, 1 and 3 are foreground
-            mask2 = np.where((mask == 2) | (mask == 0), 0, 1).astype('uint8')
-
-            # Apply mask to create transparent background
-            img_rgba = cv2.cvtColor(img_rgb, cv2.COLOR_RGB2RGBA)
-            img_rgba[:, :, 3] = mask2 * 255  # Set alpha channel
-
-            # Save the output
-            cv2.imwrite(str(output_path), img_rgba)
-            return True, None
-        except Exception as e:
-            return False, f"Failed to process {input_path.name}: {str(e)}"
-    else:
-        return remove_background_pillow(input_path, output_path)
-def process_background_removal_job(job_id, filenames):
-    """Process selected images for background removal."""
-    try:
-        meta = JOBS[job_id]
-        meta['state'] = 'bg_removing'
-        
-        log_message(job_id, f"Starting background removal for {len(filenames)} images...", "info")
-        
-        save_dir = Path(meta['folder'])
-        bg_removed_dir = save_dir / 'bg_removed'
-        bg_removed_dir.mkdir(exist_ok=True)
-        
-        processed_count = 0
-        for filename in filenames:
-            if STOP_FLAGS.get(job_id, False):
-                log_message(job_id, "Background removal stopped", "warning")
-                meta['state'] = 'stopped'
-                return
-            
-            input_path = save_dir / filename
-            if not input_path.exists():
-                log_message(job_id, f"File not found: {filename}", "error")
-                meta['stats']['errors'] += 1
-                continue
-            
-            output_filename = f"{input_path.stem}_nobg.png"
-            output_path = bg_removed_dir / output_filename
-            
-            start_time = time.time()
-            success, error = remove_background(input_path, output_path)
-            
-            if success:
-                elapsed = time.time() - start_time
-                log_message(job_id, f"Background removed: {filename} -> {output_filename} ({elapsed:.2f}s)", "success")
-                processed_count += 1
-                
-                # Update metadata
-                with JOBS_LOCK:
-                    for img in meta['images']:
-                        if img.get('filename') == filename:
-                            img['bg_removed_filename'] = output_filename
-                            break
-            else:
-                log_message(job_id, error, "error")
-                meta['stats']['errors'] += 1
-        
-        # Create ZIP for background-removed images
-        try:
-            zip_path = DOWNLOADS_DIR / f"{job_id}_bg_removed.zip"
-            shutil.make_archive(str(zip_path.with_suffix('')), 'zip', str(bg_removed_dir))
-            log_message(job_id, f"Created background-removed ZIP: {processed_count} images", "success")
-        except Exception as e:
-            log_message(job_id, f"Background-removed ZIP creation failed: {str(e)}", "error")
-            meta['stats']['errors'] += 1
-        
-        if processed_count > 0:
-            meta['state'] = 'bg_removed'
-            log_message(job_id, "Background removal completed successfully!", "success")
-        else:
-            meta['state'] = 'failed'
-            log_message(job_id, "Background removal failed: No images processed", "error")
-    
-    except Exception as e:
-        log_message(job_id, f"Background removal job failed: {str(e)}", "error")
-        meta['state'] = 'failed'
-
 def process_images_job(job_id, filenames, options):
     """Process images with real-time logging"""
     meta = JOBS[job_id]
@@ -590,13 +326,15 @@ def process_images_job(job_id, filenames, options):
             if options.get('remove_bg') and REMBG_AVAILABLE:
                 log_message(job_id, f"Removing background: {filename}", "info")
                 bg_removed_path = processed_dir / f"{base_name}_nobg.png"
-                success, error = remove_background(input_path, bg_removed_path)
-                if success:
-                    current_path = bg_removed_path
-                    log_message(job_id, f"Background removed: {filename}", "success")
-                else:
-                    log_message(job_id, error, "error")
-                    return None
+                
+                with open(current_path, 'rb') as f:
+                    input_data = f.read()
+                output_data = remove(input_data)
+                with open(bg_removed_path, 'wb') as f:
+                    f.write(output_data)
+                
+                current_path = bg_removed_path
+                log_message(job_id, f"Background removed: {filename}", "success")
             
             # Apply image enhancements
             with Image.open(current_path) as img:
@@ -712,7 +450,7 @@ def index():
                 <h1 class="text-4xl font-bold text-gray-900 mb-2">🕷️ Shopify Image Scraper</h1>
                 <p class="text-gray-600">Fast concurrent scraping with real-time logs</p>
                 <div class="text-sm text-gray-500 mt-2">
-                    BackgroundRemover: {{ '✅ Available' if rembg_available else '❌ Not installed' }}
+                    RemBG: {{ '✅ Available' if rembg_available else '❌ Not installed' }}
                 </div>
             </div>
 
@@ -1052,7 +790,7 @@ def api_start():
     return jsonify({'job_id': job_id})
 
 @app.route('/api/stop/<job_id>', methods=['POST'])
-def api_stop():
+def api_stop(job_id):
     """Stop scraping job"""
     if job_id not in JOBS:
         return jsonify({'error': 'Job not found'}), 404
@@ -1061,26 +799,6 @@ def api_stop():
     log_message(job_id, "Stop signal received", "warning")
     
     return jsonify({'status': 'stopping'})
-
-@app.route('/api/remove_background/<job_id>', methods=['POST'])
-def api_remove_background(job_id):
-    """Remove background from selected images."""
-    if job_id not in JOBS:
-        return jsonify({'error': 'Job not found'}), 404
-    
-    data = request.get_json()
-    if not data or not data.get('filenames'):
-        return jsonify({'error': 'No filenames provided'}), 400
-    
-    try:
-        threading.Thread(
-            target=lambda: process_background_removal_job(job_id, data['filenames']),
-            daemon=True
-        ).start()
-        return jsonify({'status': 'Background removal started'})
-    except Exception as e:
-        log_message(job_id, f"Failed to start background removal: {str(e)}", "error")
-        return jsonify({'error': f'Failed to start: {str(e)}'}), 500
 
 @app.route('/api/status/<job_id>')
 def api_status(job_id):
@@ -1117,7 +835,7 @@ def api_estimate():
 
 @app.route('/view/<job_id>')
 def view_results(job_id):
-    """View detailed results with processing and upload options"""
+    """View detailed results with processing options"""
     if job_id not in JOBS:
         return "Job not found", 404
     
@@ -1159,26 +877,15 @@ def view_results(job_id):
                 <div class="flex gap-3">
                     <a href="/" class="bg-gray-600 text-white px-4 py-2 rounded-md">← Back to Scraper</a>
                     <a href="/download/{{ job_id }}.zip" class="bg-blue-600 text-white px-4 py-2 rounded-md">Download ZIP</a>
-                    {% if meta.state in ['bg_removed', 'bg_generated'] %}
-                    <a href="/download/{{ job_id }}_bg_removed.zip" class="bg-green-600 text-white px-4 py-2 rounded-md">Download BG-Removed ZIP</a>
-                    {% endif %}
-                    {% if meta.state == 'bg_generated' %}
-                    <a href="/download/{{ job_id }}_bg_generated.zip" class="bg-purple-600 text-white px-4 py-2 rounded-md">Download BG-Generated ZIP</a>
-                    {% endif %}
                 </div>
             </div>
 
             <!-- Processing Panel -->
+            {% if rembg_available %}
             <div class="bg-white rounded-lg shadow p-6 mb-8">
                 <h2 class="text-xl font-semibold mb-4">Image Processing</h2>
-                <div class="grid grid-cols-1 md:grid-cols-5 gap-4 mb-4">
-                    <!-- Image Upload -->
-                    <div>
-                        <label class="block text-sm font-medium mb-1">Upload Image</label>
-                        <input id="imageUpload" type="file" accept="image/*" multiple
-                               class="w-full px-3 py-2 border rounded-md">
-                    </div>
-                    {% if rembg_available %}
+                
+                <div class="grid grid-cols-1 md:grid-cols-4 gap-4 mb-4">
                     <div>
                         <label class="block text-sm font-medium mb-1">Format</label>
                         <select id="format" class="w-full px-3 py-2 border rounded-md">
@@ -1201,16 +908,6 @@ def view_results(job_id):
                             <option value="shopify">Shopify</option>
                         </select>
                     </div>
-                    {% endif %}
-                    <div>
-                        <label class="block text-sm font-medium mb-1">Background Type</label>
-                        <select id="bgType" class="w-full px-3 py-2 border rounded-md">
-                            <option value="white">White (Amazon)</option>
-                            <option value="lifestyle">Lifestyle (Shopify)</option>
-                            <option value="studio">Studio (Shopify)</option>
-                        </select>
-                    </div>
-                    {% if rembg_available %}
                     <div class="space-y-2">
                         <label class="flex items-center text-sm">
                             <input id="removeBg" type="checkbox" class="mr-2" checked>
@@ -1225,22 +922,11 @@ def view_results(job_id):
                             Sharpen
                         </label>
                     </div>
-                    {% endif %}
                 </div>
+                
                 <div class="flex gap-3 items-center">
-                    <button onclick="uploadImages()" class="bg-blue-600 text-white px-6 py-2 rounded-md hover:bg-blue-700">
-                        Upload Images
-                    </button>
-                    {% if rembg_available %}
                     <button onclick="processSelected()" class="bg-indigo-600 text-white px-6 py-2 rounded-md hover:bg-indigo-700">
                         Process Selected
-                    </button>
-                    {% endif %}
-                    <button onclick="removeBackground()" class="bg-green-600 text-white px-6 py-2 rounded-md hover:bg-green-700">
-                        Remove Background
-                    </button>
-                    <button onclick="generateBackground()" class="bg-purple-600 text-white px-6 py-2 rounded-md hover:bg-purple-700">
-                        Generate Background
                     </button>
                     <button onclick="selectAll()" class="bg-gray-600 text-white px-4 py-2 rounded-md">
                         Select All
@@ -1248,6 +934,7 @@ def view_results(job_id):
                     <div id="processStatus" class="text-sm text-gray-600"></div>
                 </div>
             </div>
+            {% endif %}
 
             <!-- Image Grid -->
             <div class="bg-white rounded-lg shadow p-6">
@@ -1257,10 +944,11 @@ def view_results(job_id):
                         <div class="absolute top-2 left-2 z-10">
                             <input type="checkbox" class="image-select w-4 h-4" data-filename="{{ img.filename }}">
                         </div>
+                        
                         {% if img.filename %}
                         <img src="/images/{{ job_id }}/{{ img.filename }}" 
                              class="w-full h-32 object-contain bg-white cursor-pointer"
-                             onclick="openImageModal('{{ img.url or '/images/' + job_id + '/' + img.filename }}', '{{ img.filename }}')"
+                             onclick="openImageModal('{{ img.url }}', '{{ img.filename }}')"
                              onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
                         <div class="w-full h-32 flex items-center justify-center text-gray-400 hidden">
                             Failed to Load
@@ -1270,9 +958,10 @@ def view_results(job_id):
                             Download Failed
                         </div>
                         {% endif %}
+                        
                         <div class="p-2 text-xs bg-white">
                             <div class="text-blue-600 truncate">
-                                <a href="{{ img.url or '/images/' + job_id + '/' + img.filename }}" target="_blank" class="hover:underline">Source</a>
+                                <a href="{{ img.url }}" target="_blank" class="hover:underline">Source</a>
                             </div>
                             {% if img.elapsed %}
                             <div class="text-gray-500">{{ "%.2f"|format(img.elapsed) }}s</div>
@@ -1283,71 +972,27 @@ def view_results(job_id):
                             {% if img.processed_filename %}
                             <div class="text-green-600 text-xs">✓ Processed</div>
                             {% endif %}
-                            {% if img.bg_removed_filename %}
-                            <div class="text-green-600 text-xs">✓ Background Removed</div>
-                            {% endif %}
-                            {% if img.bg_generated_filename %}
-                            <div class="text-purple-600 text-xs">✓ Background Generated</div>
-                            {% endif %}
                         </div>
                     </div>
                     {% endfor %}
                 </div>
+
+                <!-- Pagination -->
                 {% if total_pages > 1 %}
                 <div class="flex justify-center items-center gap-4">
                     {% if page > 1 %}
                     <a href="/view/{{ job_id }}?page={{ page - 1 }}" 
                        class="px-4 py-2 bg-gray-200 rounded hover:bg-gray-300">← Previous</a>
                     {% endif %}
+                    
                     <span class="text-gray-600">Page {{ page }} of {{ total_pages }}</span>
+                    
                     {% if page < total_pages %}
                     <a href="/view/{{ job_id }}?page={{ page + 1 }}" 
                        class="px-4 py-2 bg-gray-200 rounded hover:bg-gray-300">Next →</a>
                     {% endif %}
                 </div>
                 {% endif %}
-            </div>
-
-            <!-- Background Removed Images Panel -->
-            <div id="bgRemovedPanel" class="mt-8 {% if meta.state != 'bg_removed' and meta.state != 'bg_generated' %}hidden{% endif %}">
-                <div class="bg-white rounded-lg shadow p-6">
-                    <h2 class="text-xl font-semibold mb-4">📸 Background Removed Images</h2>
-                    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
-                        {% for img in page_images %}
-                        {% if img.bg_removed_filename %}
-                        <div class="border rounded-lg overflow-hidden bg-gray-50">
-                            <img src="/images/{{ job_id }}/bg_removed/{{ img.bg_removed_filename }}" 
-                                 class="w-full h-32 object-contain bg-white cursor-pointer"
-                                 onclick="openImageModal('/images/{{ job_id }}/bg_removed/{{ img.bg_removed_filename }}', '{{ img.bg_removed_filename }}')">
-                            <div class="p-2 text-xs bg-white">
-                                <div class="text-green-600">{{ img.bg_removed_filename }}</div>
-                            </div>
-                        </div>
-                        {% endif %}
-                        {% endfor %}
-                    </div>
-                </div>
-            </div>
-
-            <!-- Background Generated Images Panel -->
-            <div id="bgGeneratedPanel" class="mt-8 {% if meta.state != 'bg_generated' %}hidden{% endif %}">
-                <div class="bg-white rounded-lg shadow p-6">
-                    <h2 class="text-xl font-semibold mb-4">🎨 Background Generated Images</h2>
-                    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-6 gap-4">
-                        {% for img in page_images %}
-                        {% if img.bg_generated_filename %}
-                        <div class="border rounded-lg overflow-hidden bg-gray-50">
-                            <img src="/images/{{ job_id }}/bg_generated/{{ img.bg_generated_filename }}" 
-                                 class="w-full h-32 object-contain bg-white cursor-pointer"
-                                 onclick="openImageModal('/images/{{ job_id }}/bg_generated/{{ img.bg_generated_filename }}', '{{ img.bg_generated_filename }}')">
-                            <div class="p-2 text-xs bg-white">
-                                <div class="text-purple-600">{{ img.bg_generated_filename }}</div>
-                            </div>
-                        </div>
-                        {% endif %}
-                        {% endfor %}
-                    </div>
-                </div>
             </div>
         </div>
     </div>
@@ -1379,7 +1024,7 @@ def view_results(job_id):
 
     function openImageModal(sourceUrl, filename) {
         document.getElementById('modalTitle').textContent = filename;
-        document.getElementById('modalImage').src = sourceUrl;
+        document.getElementById('modalImage').src = `/images/{{ job_id }}/${filename}`;
         document.getElementById('modalSource').href = sourceUrl;
         document.getElementById('imageModal').classList.remove('hidden');
     }
@@ -1388,47 +1033,16 @@ def view_results(job_id):
         document.getElementById('imageModal').classList.add('hidden');
     }
 
-    async function uploadImages() {
-        const input = document.getElementById('imageUpload');
-        if (!input.files.length) {
-            alert('Please select at least one image to upload');
-            return;
-        }
-
-        const formData = new FormData();
-        for (const file of input.files) {
-            formData.append('images', file);
-        }
-
-        try {
-            document.getElementById('processStatus').textContent = 'Uploading images...';
-            const response = await fetch('/api/upload_image/{{ job_id }}', {
-                method: 'POST',
-                body: formData
-            });
-            const result = await response.json();
-            if (result.error) {
-                alert(result.error);
-                document.getElementById('processStatus').textContent = '';
-                return;
-            }
-            document.getElementById('processStatus').textContent = '✅ Images uploaded!';
-            setTimeout(() => window.location.reload(), 1000);
-        } catch (error) {
-            console.error('Upload error:', error);
-            alert('Image upload failed: ' + error.message);
-            document.getElementById('processStatus').textContent = '';
-        }
-    }
-
     async function processSelected() {
         const selected = Array.from(document.querySelectorAll('.image-select:checked'))
                               .map(cb => cb.dataset.filename)
                               .filter(Boolean);
+        
         if (selected.length === 0) {
             alert('Please select at least one image to process');
             return;
         }
+
         const options = {
             remove_bg: document.getElementById('removeBg').checked,
             upscale: document.getElementById('upscale').checked,
@@ -1440,134 +1054,29 @@ def view_results(job_id):
             contrast: 1.0,
             workers: 4
         };
+
         try {
             document.getElementById('processStatus').textContent = 'Starting processing...';
+            
             const response = await fetch('/api/process/{{ job_id }}', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ filenames: selected, options })
             });
+
             const result = await response.json();
+            
             if (result.error) {
                 alert(result.error);
                 return;
             }
+
             document.getElementById('processStatus').textContent = 'Processing in progress...';
             pollProcessing();
+            
         } catch (error) {
-            console.error('Processing error:', error);
             alert('Processing failed: ' + error.message);
             document.getElementById('processStatus').textContent = '';
-        }
-    }
-
-    async function removeBackground() {
-        const selected = Array.from(document.querySelectorAll('.image-select:checked'))
-                              .map(cb => cb.dataset.filename)
-                              .filter(Boolean);
-        if (selected.length === 0) {
-            alert('Please select at least one image to process');
-            return;
-        }
-        try {
-            document.getElementById('processStatus').textContent = 'Starting background removal...';
-            const response = await fetch('/api/remove_background/{{ job_id }}', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filenames: selected })
-            });
-            const result = await response.json();
-            if (result.error) {
-                alert(result.error);
-                return;
-            }
-            document.getElementById('processStatus').textContent = 'Background removal in progress...';
-            pollBackgroundRemoval();
-        } catch (error) {
-            console.error('Background removal error:', error);
-            alert('Background removal failed: ' + error.message);
-            document.getElementById('processStatus').textContent = '';
-        }
-    }
-
-    async function generateBackground() {
-        const selected = Array.from(document.querySelectorAll('.image-select:checked'))
-                              .map(cb => cb.dataset.filename)
-                              .filter(Boolean);
-        if (selected.length === 0) {
-            alert('Please select at least one image to process');
-            return;
-        }
-        const bgType = document.getElementById('bgType').value;
-        try {
-            console.log('Starting background generation for:', selected, 'with type:', bgType);
-            document.getElementById('processStatus').textContent = 'Starting background generation...';
-            const response = await fetch('/api/generate_background/{{ job_id }}', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ filenames: selected, bg_type: bgType })
-            });
-            const result = await response.json();
-            if (result.error) {
-                console.error('Background generation error:', result.error);
-                alert(result.error);
-                return;
-            }
-            console.log('Background generation started:', result);
-            document.getElementById('processStatus').textContent = 'Background generation in progress...';
-            pollBackgroundGeneration();
-        } catch (error) {
-            console.error('Background generation fetch error:', error);
-            alert('Background generation failed: ' + error.message);
-            document.getElementById('processStatus').textContent = '';
-        }
-    }
-
-    async function pollBackgroundRemoval() {
-        while (true) {
-            try {
-                const response = await fetch('/api/status/{{ job_id }}');
-                const status = await response.json();
-                console.log('Background removal status:', status);
-                if (status.state === 'bg_removed') {
-                    document.getElementById('processStatus').textContent = '✅ Background removal completed!';
-                    document.getElementById('bgRemovedPanel').classList.remove('hidden');
-                    setTimeout(() => window.location.reload(), 2000);
-                    break;
-                } else if (status.state === 'failed') {
-                    document.getElementById('processStatus').textContent = '❌ Background removal failed';
-                    break;
-                }
-                await new Promise(resolve => setTimeout(resolve, 1000));
-            } catch (error) {
-                console.error('Polling error:', error);
-                document.getElementById('processStatus').textContent = '⚠️ Polling error';
-                break;
-            }
-        }
-    }
-
-    async function pollBackgroundGeneration() {
-        while (true) {
-            try {
-                const response = await fetch('/api/status/{{ job_id }}');
-                const status = await response.json();
-                console.log('Background generation status:', status);
-                if (status.state === 'bg_generated') {
-                    document.getElementById('processStatus').textContent = '✅ Background generation completed!';
-                    document.getElementById('bgGeneratedPanel').classList.remove('hidden');
-                    setTimeout(() => window.location.reload(), 2000);
-                    break;
-                } else if (status.state === 'failed') {
-                    document.getElementById('processStatus').textContent = '❌ Background generation failed';
-                    break;
-                }
-                await new Promise(resolve => setTimeout(resolve, 1000));
-            } catch (error) {
-                console.error('Polling error:', error);
-                document.getElementById('processStatus').textContent = '⚠️ Polling error';
-                break;
-            }
         }
     }
 
@@ -1576,7 +1085,7 @@ def view_results(job_id):
             try {
                 const response = await fetch('/api/status/{{ job_id }}');
                 const status = await response.json();
-                console.log('Processing status:', status);
+                
                 if (status.state === 'processed') {
                     document.getElementById('processStatus').textContent = '✅ Processing completed!';
                     setTimeout(() => window.location.reload(), 2000);
@@ -1585,10 +1094,9 @@ def view_results(job_id):
                     document.getElementById('processStatus').textContent = '❌ Processing failed';
                     break;
                 }
+                
                 await new Promise(resolve => setTimeout(resolve, 1000));
             } catch (error) {
-                console.error('Polling error:', error);
-                document.getElementById('processStatus').textContent = '⚠️ Polling error';
                 break;
             }
         }
@@ -1610,65 +1118,6 @@ def view_results(job_id):
     rembg_available=REMBG_AVAILABLE
     )
 
-@app.route('/api/upload_image/<job_id>', methods=['POST'])
-def api_upload_image(job_id):
-    """Upload images to a job folder and update metadata."""
-    if job_id not in JOBS:
-        return jsonify({'error': 'Job not found'}), 404
-    
-    if 'images' not in request.files:
-        return jsonify({'error': 'No images uploaded'}), 400
-    
-    meta = JOBS[job_id]
-    save_dir = Path(meta['folder'])
-    save_dir.mkdir(exist_ok=True)
-    
-    uploaded_filenames = []
-    for file in request.files.getlist('images'):
-        try:
-            filename = f"uploaded_{uuid.uuid4().hex[:8]}{Path(file.filename).suffix}"
-            file_path = save_dir / filename
-            file.save(file_path)
-            
-            # Create thumbnail for faster preview
-            try:
-                with Image.open(file_path) as img:
-                    img.thumbnail((300, 300), Image.LANCZOS)
-                    img.save(file_path, quality=85, optimize=True)
-            except Exception as e:
-                log_message(job_id, f"Failed to create thumbnail for {filename}: {str(e)}", "error")
-            
-            # Update metadata
-            with JOBS_LOCK:
-                meta['images'].append({
-                    'url': None,  # No source URL for uploaded images
-                    'filename': filename,
-                    'elapsed': 0,
-                    'error': None,
-                    'processed_filename': None,
-                    'bg_removed_filename': None,
-                    'bg_generated_filename': None
-                })
-                meta['stats']['images'] += 1
-                meta['stats']['downloaded'] += 1
-                uploaded_filenames.append(filename)
-            
-            log_message(job_id, f"Uploaded image: {filename}", "success")
-        except Exception as e:
-            log_message(job_id, f"Failed to upload {file.filename}: {str(e)}", "error")
-            continue
-    
-    if uploaded_filenames:
-        # Update ZIP archive to include new images
-        try:
-            zip_path = DOWNLOADS_DIR / f"{job_id}.zip"
-            shutil.make_archive(str(zip_path.with_suffix('')), 'zip', str(save_dir))
-            log_message(job_id, f"Updated ZIP with {len(uploaded_filenames)} new images", "success")
-        except Exception as e:
-            log_message(job_id, f"ZIP update failed: {str(e)}", "error")
-    
-    return jsonify({'status': 'Images uploaded', 'filenames': uploaded_filenames})
-
 @app.route('/api/process/<job_id>', methods=['POST'])
 def api_process(job_id):
     """Process selected images"""
@@ -1686,114 +1135,20 @@ def api_process(job_id):
     
     return jsonify({'status': 'Processing started'})
 
-@app.route('/images/<job_id>/<path:filename>')
+@app.route('/images/<job_id>/<filename>')
 def serve_image(job_id, filename):
-    """Serve images from job folder or subfolders."""
+    """Serve images from job folder"""
     if job_id not in JOBS:
         return "Job not found", 404
     
     job_folder = Path(JOBS[job_id]['folder'])
     
-    for folder in [job_folder, job_folder / 'processed', job_folder / 'bg_removed', job_folder / 'bg_generated']:
+    for folder in [job_folder, job_folder / 'processed']:
         file_path = folder / filename
         if file_path.exists():
             return send_from_directory(str(folder), filename)
     
     return "Image not found", 404
-
-@app.route('/api/generate_background/<job_id>', methods=['POST'])
-def api_generate_background(job_id):
-    """Generate background for selected images."""
-    if job_id not in JOBS:
-        return jsonify({'error': 'Job not found'}), 404
-    
-    data = request.get_json()
-    if not data or not data.get('filenames') or not data.get('bg_type'):
-        return jsonify({'error': 'No filenames or background type provided'}), 400
-    
-    bg_type = data['bg_type']
-    if bg_type not in ['white', 'lifestyle', 'studio']:
-        return jsonify({'error': 'Invalid background type'}), 400
-    
-    try:
-        threading.Thread(
-            target=lambda: process_background_generation_job(job_id, data['filenames'], bg_type),
-            daemon=True
-        ).start()
-        return jsonify({'status': 'Background generation started'})
-    except Exception as e:
-        log_message(job_id, f"Failed to start background generation: {str(e)}", "error")
-        return jsonify({'error': f'Failed to start: {str(e)}'}), 500
-
-@app.route('/suggest-scene', methods=['POST'])
-def suggest_scene():
-    if not OPENAI_AVAILABLE or not CLIP_AVAILABLE:
-        return jsonify({'error': 'AI dependencies not available'}), 503
-
-    data = request.get_json()
-    category = data.get('category')
-    store_url = data.get('store_url')
-    if not category or not store_url:
-        return jsonify({'error': 'Category and store_url required'}), 400
-
-    try:
-        # Get brand description
-        resp = requests.get(store_url, verify=False, timeout=10)
-        soup = BeautifulSoup(resp.content, "html.parser")
-        brand_description = ""
-        # Try meta description
-        meta_desc = soup.find('meta', attrs={'name': 'description'})
-        if meta_desc:
-            brand_description = meta_desc['content']
-        else:
-            # Try about section or title
-            title = soup.title.string if soup.title else ""
-            brand_description = title
-        if not brand_description:
-            brand_description = store_url.split('//')[1].split('.')[0].capitalize() + " brand"
-
-        # Generate 10 prompts with GPT
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-        if not client.api_key:
-            return jsonify({'error': 'OpenAI API key not set'}), 500
-
-        prompt = f"Generate 10 detailed prompt suggestions for lifestyle background scenes for a product photography of {category}. Make them diverse and creative."
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a creative AI for generating background prompts for product photos."},
-                {"role": "user", "content": prompt}
-            ]
-        )
-        content = response.choices[0].message.content
-        # Parse to list, assume numbered
-        prompts = []
-        for line in content.split('\n'):
-            if line.strip().startswith(tuple(str(i) + '.' for i in range(1,11))):
-                prompts.append(line.split('.',1)[1].strip())
-        if len(prompts) < 5:
-            return jsonify({'error': 'Failed to generate enough prompts'}), 500
-
-        # Now rank with CLIP
-        model = CLIPModel.from_pretrained("openai/clip-vit-base-patch32")
-        processor = CLIPProcessor.from_pretrained("openai/clip-vit-base-patch32")
-        # Embed brand description
-        inputs = processor(text=[brand_description], images=None, return_tensors="pt", padding=True)
-        with torch.no_grad():
-            brand_embedding = model.get_text_features(**inputs)
-        # Embed prompts
-        inputs = processor(text=prompts, images=None, return_tensors="pt", padding=True)
-        with torch.no_grad():
-            prompt_embeddings = model.get_text_features(**inputs)
-        # Compute similarities
-        similarities = torch.nn.functional.cosine_similarity(brand_embedding, prompt_embeddings, dim=1)
-        # Get top 5 indices
-        top_indices = similarities.topk(5).indices.tolist()
-        top_prompts = [prompts[i] for i in top_indices]
-
-        return jsonify({'suggestions': top_prompts})
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
 
 @app.route('/download/<filename>')
 def download_file(filename):
@@ -1807,7 +1162,7 @@ def download_file(filename):
 # ----------------------- Background Cleanup -----------------------
 
 def cleanup_old_jobs():
-    """Clean up expired jobs."""
+    """Clean up expired jobs"""
     while True:
         try:
             with JOBS_LOCK:
@@ -1820,7 +1175,7 @@ def cleanup_old_jobs():
                     if job_folder.exists():
                         shutil.rmtree(job_folder, ignore_errors=True)
                     
-                    for suffix in ['', '_processed', '_bg_removed', '_bg_generated']:
+                    for suffix in ['', '_processed']:
                         zip_file = DOWNLOADS_DIR / f"{job_id}{suffix}.zip"
                         if zip_file.exists():
                             zip_file.unlink()
@@ -1838,12 +1193,11 @@ def cleanup_old_jobs():
 if __name__ == '__main__':
     print("🚀 Starting Optimized Shopify Image Scraper...")
     print(f"📁 Downloads Directory: {DOWNLOADS_DIR}")
-    print(f"🔧 BackgroundRemover Available: {REMBG_AVAILABLE}")
+    print(f"🔧 RemBG Available: {REMBG_AVAILABLE}")
     
     # Start cleanup thread
     threading.Thread(target=cleanup_old_jobs, daemon=True).start()
     
-    # Run
     # Run Flask app
     app.run(
         debug=False,
